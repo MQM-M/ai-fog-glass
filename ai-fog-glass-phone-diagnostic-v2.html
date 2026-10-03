@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>AI Fog Glass - Phone Diagnostic v2</title>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #000; overflow: hidden; font-family: monospace; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+        video { transform: scaleX(-1); /* 镜像翻转前置摄像头 */ }
+        #ui-panel {
+            position: absolute; top: 15px; left: 15px; z-index: 10;
+            background: rgba(10, 20, 30, 0.85); color: #0f0;
+            padding: 12px; border-radius: 8px; font-size: 13px;
+            text-shadow: 1px 1px 0 #000;
+            border: 1px solid #00ffcc;
+            max-width: 85%;
+            pointer-events: auto; /* 允许点击按钮 */
+            backdrop-filter: blur(4px);
+        }
+        .status-item { margin-bottom: 6px; letter-spacing: 0.5px; }
+        .error { color: #ff3366; font-weight: bold; }
+        .warn { color: #ffcc00; font-weight: bold; }
+        .ok { color: #00ffcc; font-weight: bold; }
+        .title { color: #fff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #555; padding-bottom: 5px;}
+        #export-btn {
+            background: #00ffcc; color: #000; border: none; padding: 8px; width: 100%;
+            margin-top: 10px; font-weight: bold; font-family: monospace; border-radius: 4px;
+            cursor: pointer; box-shadow: 0 0 5px #00ffcc;
+        }
+        #export-btn:active { background: #00ccaa; }
+        #interaction-layer { z-index: 5; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="fog-canvas"></canvas>
+        <div id="ui-panel">
+            <div class="title">AI FOG DIAGNOSTIC v1.1</div>
+            <div class="status-item">CAMERA: <span id="cam-status" class="warn">INITIALIZING...</span></div>
+            <div class="status-item">AI MODEL: <span id="ai-status" class="warn">INITIALIZING...</span></div>
+            <div class="status-item">HAND: <span id="hand-status" class="warn">SEARCHING...</span></div>
+            <div class="status-item">PINCH: <span id="pinch-status" class="warn">NO</span></div>
+            <div class="status-item">FPS: <span id="fps-status" class="ok">0</span></div>
+            <button id="export-btn">⬇ EXPORT LOG</button>
+            <div class="status-item" id="error-log" style="color:#ff3366; margin-top:10px; white-space:pre-wrap; font-size: 11px; word-wrap: break-word; pointer-events: none;"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+        const video = document.getElementById('webcam');
+        const fogCanvas = document.getElementById('fog-canvas');
+        const fogCtx = fogCanvas.getContext('2d', { willReadFrequently: true });
+        const ui = {
+            cam: document.getElementById('cam-status'),
+            ai: document.getElementById('ai-status'),
+            hand: document.getElementById('hand-status'),
+            pinch: document.getElementById('pinch-status'),
+            fps: document.getElementById('fps-status'),
+            log: document.getElementById('error-log'),
+            exportBtn: document.getElementById('export-btn')
+        };
+
+        const systemLogs = [];
+        
+        function logSys(level, msg) {
+            const time = new Date().toISOString().split('T')[1].replace('Z', '');
+            systemLogs.push(`[${time}] [${level}] ${msg}`);
+            if (level === 'ERROR') {
+                console.error(msg);
+                const currentLog = ui.log.innerText;
+                ui.log.innerText = msg + "\n" + currentLog.substring(0, 150);
+            } else {
+                console.log(msg);
+            }
+        }
+
+        function setStatus(el, text, state) {
+            el.innerText = text;
+            el.className = state;
+            logSys('INFO', `Status changed - ${el.id}: ${text}`);
+        }
+
+        ui.exportBtn.addEventListener('click', () => {
+            const logContent = [
+                "=== AI FOG DIAGNOSTIC LOG ===",
+                `UserAgent: ${navigator.userAgent}`,
+                `Window Size: ${window.innerWidth}x${window.innerHeight}`,
+                `Protocol: ${window.location.protocol}`,
+                `Time: ${new Date().toLocaleString()}`,
+                "",
+                "=== CURRENT STATE ===",
+                `CAMERA: ${ui.cam.innerText}`,
+                `AI MODEL: ${ui.ai.innerText}`,
+                `HAND: ${ui.hand.innerText}`,
+                `PINCH: ${ui.pinch.innerText}`,
+                "",
+                "=== SYSTEM LOGS ===",
+                ...systemLogs
+            ].join("\n");
+
+            const blob = new Blob([logContent], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `fog_diagnostic_${Date.now()}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
+
+        let handLandmarker;
+        let lastVideoTime = -1;
+        let isPinching = false;
+        
+        function resize() {
+            fogCanvas.width = window.innerWidth;
+            fogCanvas.height = window.innerHeight;
+            fogCtx.globalCompositeOperation = 'source-over';
+            fogCtx.fillStyle = 'rgba(15, 25, 35, 0.95)';
+            fogCtx.fillRect(0, 0, fogCanvas.width, fogCanvas.height);
+            logSys('INFO', `Canvas resized to ${fogCanvas.width}x${fogCanvas.height}`);
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        async function startCamera() {
+            logSys('INFO', 'Requesting camera (facingMode: user)...');
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: "user" }, width: { ideal: 640 }, height: { ideal: 480 } }
+                });
+                video.srcObject = stream;
+                return new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        logSys('INFO', `Camera loaded: ${video.videoWidth}x${video.videoHeight}`);
+                        video.play();
+                        setStatus(ui.cam, 'ONLINE (FRONT)', 'ok');
+                        resolve(true);
+                    };
+                });
+            } catch (err) {
+                setStatus(ui.cam, 'ERROR', 'error');
+                if (window.location.protocol === 'file:') {
+                    logSys('ERROR', "Blocked: Cannot access camera on file:// protocol. Use HTTPS.");
+                } else {
+                    logSys('ERROR', "Camera Error: " + err.name + " - " + err.message);
+                }
+                return false;
+            }
+        }
+
+        async function initAI() {
+            logSys('INFO', 'Loading MediaPipe WASM...');
+            try {
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+                );
+                
+                logSys('INFO', 'Attempting GPU Delegate...');
+                try {
+                    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                        baseOptions: {
+                            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                            delegate: "GPU"
+                        },
+                        runningMode: "VIDEO",
+                        numHands: 1,
+                        minHandDetectionConfidence: 0.48,
+                        minHandPresenceConfidence: 0.48,
+                        minTrackingConfidence: 0.48
+                    });
+                    setStatus(ui.ai, 'READY (GPU)', 'ok');
+                } catch (gpuErr) {
+                    logSys('ERROR', "GPU Delegate failed: " + gpuErr.message);
+                    setStatus(ui.ai, 'RETRYING CPU...', 'warn');
+                    
+                    logSys('INFO', 'Fallback to CPU Delegate...');
+                    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                        baseOptions: {
+                            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                            delegate: "CPU"
+                        },
+                        runningMode: "VIDEO",
+                        numHands: 1,
+                        minHandDetectionConfidence: 0.48,
+                        minHandPresenceConfidence: 0.48,
+                        minTrackingConfidence: 0.48
+                    });
+                    setStatus(ui.ai, 'READY (CPU)', 'ok');
+                }
+                return true;
+            } catch (err) {
+                setStatus(ui.ai, 'FAILED', 'error');
+                logSys('ERROR', "AI Init failed: " + err.name + " - " + err.message);
+                return false;
+            }
+        }
+
+        function getDistance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+        }
+
+        let frames = 0;
+        let lastFpsTime = performance.now();
+        let lastErasePos = null;
+        let aiRunning = false;
+
+        async function predictWebcam() {
+            let startTimeMs = performance.now();
+            frames++;
+            if (startTimeMs - lastFpsTime >= 1000) {
+                ui.fps.innerText = frames;
+                frames = 0;
+                lastFpsTime = startTimeMs;
+            }
+
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                
+                if (handLandmarker) {
+                    try {
+                        const results = handLandmarker.detectForVideo(video, startTimeMs);
+                        if (!aiRunning) {
+                            logSys('INFO', 'AI Inference started successfully.');
+                            aiRunning = true;
+                        }
+                        
+                        if (results.landmarks && results.landmarks.length > 0) {
+                            if (ui.hand.innerText !== 'DETECTED') setStatus(ui.hand, 'DETECTED', 'ok');
+                            const landmarks = results.landmarks[0];
+                            
+                            const wrist = landmarks[0];
+                            const thumbTip = landmarks[4];
+                            const indexTip = landmarks[8];
+                            const indexMcp = landmarks[5]; 
+
+                            const screenX = (1 - indexTip.x) * fogCanvas.width;
+                            const screenY = indexTip.y * fogCanvas.height;
+
+                            const palmScale = getDistance(wrist, indexMcp); 
+                            const pinchDist = getDistance(thumbTip, indexTip);
+                            const pinchRatio = pinchDist / palmScale;
+
+                            if (pinchRatio < 0.48) {
+                                isPinching = true;
+                                ui.pinch.innerText = 'YES (' + pinchRatio.toFixed(2) + ')';
+                                ui.pinch.className = 'ok';
+                                
+                                if (lastErasePos) {
+                                    eraseFogLine(lastErasePos.x, lastErasePos.y, screenX, screenY);
+                                } else {
+                                    eraseFogPoint(screenX, screenY);
+                                }
+                                lastErasePos = { x: screenX, y: screenY };
+                            } else {
+                                isPinching = false;
+                                ui.pinch.innerText = 'NO (' + pinchRatio.toFixed(2) + ')';
+                                ui.pinch.className = 'warn';
+                                lastErasePos = null;
+                            }
+                        } else {
+                            if (ui.hand.innerText !== 'SEARCHING...') setStatus(ui.hand, 'SEARCHING...', 'warn');
+                            ui.pinch.innerText = 'NO';
+                            ui.pinch.className = 'warn';
+                            isPinching = false;
+                            lastErasePos = null;
+                        }
+                    } catch (e) {
+                        logSys('ERROR', "Inference Error: " + e.message);
+                    }
+                }
+            }
+            
+            recoverFog();
+            window.requestAnimationFrame(predictWebcam);
+        }
+
+        function eraseFogPoint(x, y) {
+            fogCtx.globalCompositeOperation = 'destination-out';
+            const radius = Math.min(fogCanvas.width, fogCanvas.height) * 0.08; 
+            const gradient = fogCtx.createRadialGradient(x, y, radius*0.2, x, y, radius);
+            gradient.addColorStop(0, 'rgba(0,0,0,1)');
+            gradient.addColorStop(0.5, 'rgba(0,0,0,0.5)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+
+            fogCtx.fillStyle = gradient;
+            fogCtx.beginPath();
+            fogCtx.arc(x, y, radius, 0, Math.PI * 2);
+            fogCtx.fill();
+        }
+
+        function eraseFogLine(x1, y1, x2, y2) {
+            const dist = getDistance({x: x1, y: y1}, {x: x2, y: y2});
+            const steps = Math.ceil(dist / 10);
+            for(let i=1; i<=steps; i++) {
+                const cx = x1 + (x2 - x1) * (i / steps);
+                const cy = y1 + (y2 - y1) * (i / steps);
+                eraseFogPoint(cx, cy);
+            }
+        }
+
+        function recoverFog() {
+            fogCtx.globalCompositeOperation = 'source-over';
+            fogCtx.fillStyle = 'rgba(15, 25, 35, 0.035)'; 
+            fogCtx.fillRect(0, 0, fogCanvas.width, fogCanvas.height);
+        }
+
+        fogCanvas.addEventListener('touchmove', (e) => {
+            if(!isPinching) {
+                e.preventDefault();
+                for(let i=0; i<e.touches.length; i++) {
+                    eraseFogPoint(e.touches[i].clientX, e.touches[i].clientY);
+                }
+            }
+        }, { passive: false });
+        
+        fogCanvas.addEventListener('mousemove', (e) => {
+             if(!isPinching && e.buttons === 1) {
+                 eraseFogPoint(e.clientX, e.clientY);
+             }
+        });
+
+        async function main() {
+            logSys('INFO', 'App started.');
+            const camReady = await startCamera();
+            if (!camReady) return;
+            const aiReady = await initAI();
+            if (aiReady) {
+                predictWebcam();
+            }
+        }
+
+        main();
+    </script>
+</body>
+</html>
